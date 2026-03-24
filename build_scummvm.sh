@@ -49,6 +49,13 @@ case "$DEVICE" in
         ;;
 esac
 
+# Check if the toolchain script exists
+if [ ! -f "$TOOLCHAIN_SCRIPT" ]; then
+    echo "Error: Toolchain script not found at: $TOOLCHAIN_SCRIPT"
+    echo "Please update the path in scummvm_build.sh"
+    exit 1
+fi
+
 # ===== Branch =====
 BRANCH="$2"
 
@@ -162,6 +169,10 @@ mkdir -p "$OUT_DIR/Extra"
 echo "Copying Extra"
 cp -f -r "$SCRIPT_DIR/scummvm/dists/engine-data/"* "$OUT_DIR/Extra/"
 cp -f "$SCRIPT_DIR/scummvm/backends/vkeybd/packs/vkeybd_default.zip" "$OUT_DIR/Extra"
+
+# Collect GLSL shaders
+mkdir -p "$OUT_DIR/Extra/shaders/"
+find "$SCRIPT_DIR/scummvm/engines/" -type f \( -name '*.fragment' -o -name '*.vertex' \) -exec cp -f {} "$OUT_DIR/Extra/shaders/" \;
 
 # ===== Cleanup =====
 rm -f "$SCRIPT_DIR/scummvm/$SVM_BIN"
