@@ -1,0 +1,587 @@
+diff --git a/gfx/drivers_context/khr_display_ctx.c b/gfx/drivers_context/khr_display_ctx.c
+--- a/gfx/drivers_context/khr_display_ctx.c
++++ b/gfx/drivers_context/khr_display_ctx.c
+@@ -16,6 +16,7 @@
+ #include <compat/strl.h>
+ #include <string/stdstring.h>
+ #include <retro_timers.h>
++#include <stdio.h>
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "../../config.h"
+@@ -26,6 +27,37 @@
+ #include "../../verbosity.h"
+ #include "../../configuration.h"
+ 
++/* Display rotation: read fbcon=rotate:N from the kernel command line and
++ * advertise *swapped* dimensions to RetroArch's outer layer when the
++ * orientation is portrait. This makes get_video_size() report landscape
++ * (e.g., 1920x1080) even though Mesa's KHR_display owns a portrait
++ * (1080x1920) swapchain. The actual rotation blit happens later in
++ * gfx/drivers/vulkan.c.
++ *
++ * Kept identical in spirit to drm_rga_get_rotation() in drm_ctx.c so the
++ * GL and Vulkan paths agree on the rotation source-of-truth. */
++static unsigned khr_display_get_rotation(void)
++{
++   FILE *fp = fopen("/proc/cmdline", "r");
++   char buf[4096], *p;
++   unsigned r = 0;
++   if (!fp)
++      return 0;
++   if (fgets(buf, sizeof(buf), fp))
++   {
++      p = strstr(buf, "fbcon=rotate:");
++      if (p)
++      {
++         p += 13;
++         r  = (unsigned)atoi(p);
++         if (r > 3)
++            r = 0;
++      }
++   }
++   fclose(fp);
++   return r;
++}
++
+ typedef struct
+ {
+    gfx_ctx_vulkan_data_t vk;
+@@ -164,6 +196,25 @@
+    khr->height                    = khr->vk.context.swapchain_height;
+    khr->refresh_rate_x1000        = info.refresh_rate_x1000;
+ 
++   /* Display-rotation: when the panel is mounted rotated 90/270° (i.e.
++    * orientation & 1), report transposed dimensions to RetroArch so its
++    * outer video_driver layer thinks the screen is landscape. The actual
++    * Mesa-owned swapchain stays portrait; gfx/drivers/vulkan.c renders
++    * into a landscape intermediate and rotates to the portrait swapchain
++    * before present. */
++   {
++      unsigned rot = khr_display_get_rotation();
++      if (rot && (rot & 1))
++      {
++         unsigned tmp = khr->width;
++         khr->width   = khr->height;
++         khr->height  = tmp;
++         RARCH_LOG("[KHR/Display] Panel rotation %u° detected; "
++               "reporting %ux%u (landscape) to outer layer.\n",
++               rot * 90, khr->width, khr->height);
++      }
++   }
++
+    return true;
+ }
+ 
+diff --git a/gfx/drivers/vulkan.c b/gfx/drivers/vulkan.c
+--- a/gfx/drivers/vulkan.c
++++ b/gfx/drivers/vulkan.c
+@@ -16,6 +16,7 @@
+ 
+ #include <stdint.h>
+ #include <math.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include <retro_assert.h>
+@@ -223,6 +224,27 @@
+       VkPipelineCache cache;
+    } pipelines;
+ 
++   /* Display rotation. When display_rotation is non-zero, the main render
++    * pass renders into display_rot.images[i] (a landscape intermediate,
++    * one per swapchain image). After the main pass ends, a fullscreen-quad
++    * rotation pass samples that intermediate and writes the actual
++    * portrait swapchain backbuffer (via display_rot.real_fb[i]) with
++    * rotated UVs.
++    *
++    * Architectural pair: khr_display_ctx.c reports landscape dims to
++    * RA's outer layer, so vulkan_frame's local width/height arrive
++    * landscape and every menu/font/widget callsite lays out correctly
++    * for the intermediate. This file just routes the framebuffer.
++    */
++   unsigned display_rotation;
++   struct
++   {
++      struct vk_image       images[VULKAN_MAX_SWAPCHAIN_IMAGES];
++      VkFramebuffer         real_fb[VULKAN_MAX_SWAPCHAIN_IMAGES];
++      unsigned              width;   /* landscape — transposed swapchain */
++      unsigned              height;
++   } display_rot;
++
+    struct
+    {
+       VkPipeline pipelines[8 * 2];
+@@ -2288,6 +2310,360 @@
+          &rp_info, NULL, &vk->readback_render_pass);
+ }
+ 
++/* --- Display-rotation helpers ----------------------------------------------
++ *
++ * Companion to the swap performed in khr_display_ctx.c — that file makes
++ * RA's outer layer report landscape dims (e.g., 1920x1080) for a panel
++ * that physically scans out portrait (1080x1920). This file:
++ *   1) Allocates a landscape-sized intermediate image per swapchain image.
++ *   2) Redirects the main render pass framebuffer to that intermediate.
++ *   3) After the main pass ends, runs a fullscreen-quad rotation pass that
++ *      samples the intermediate and writes the actual portrait swapchain
++ *      backbuffer with rotated UVs.
++ *
++ * Mali-G52 / rk3576 / Mesa KHR_display advertises only IDENTITY in
++ * supportedTransforms, so the WSI's preTransform mechanism cannot
++ * perform this rotation — application-side rotation is the contained fix.
++ */
++
++static unsigned vulkan_read_panel_rotation(void)
++{
++   FILE *fp = fopen("/proc/cmdline", "r");
++   char buf[4096], *p;
++   unsigned r = 0;
++   if (!fp)
++      return 0;
++   if (fgets(buf, sizeof(buf), fp))
++   {
++      p = strstr(buf, "fbcon=rotate:");
++      if (p)
++      {
++         p += 13;
++         r  = (unsigned)atoi(p);
++         if (r > 3)
++            r = 0;
++      }
++   }
++   fclose(fp);
++   return r;
++}
++
++static void vulkan_destroy_display_rot_image(VkDevice device, struct vk_image *img)
++{
++   if (img->framebuffer != VK_NULL_HANDLE)
++      vkDestroyFramebuffer(device, img->framebuffer, NULL);
++   if (img->view != VK_NULL_HANDLE)
++      vkDestroyImageView(device, img->view, NULL);
++   if (img->image != VK_NULL_HANDLE)
++      vkDestroyImage(device, img->image, NULL);
++   if (img->memory != VK_NULL_HANDLE)
++      vkFreeMemory(device, img->memory, NULL);
++   memset(img, 0, sizeof(*img));
++}
++
++static void vulkan_destroy_rotation_resources(vk_t *vk)
++{
++   unsigned i;
++   if (!vk->context || !vk->context->device)
++      return;
++   for (i = 0; i < VULKAN_MAX_SWAPCHAIN_IMAGES; i++)
++   {
++      vulkan_destroy_display_rot_image(vk->context->device,
++            &vk->display_rot.images[i]);
++      if (vk->display_rot.real_fb[i] != VK_NULL_HANDLE)
++      {
++         vkDestroyFramebuffer(vk->context->device,
++               vk->display_rot.real_fb[i], NULL);
++         vk->display_rot.real_fb[i] = VK_NULL_HANDLE;
++      }
++   }
++   vk->display_rot.width  = 0;
++   vk->display_rot.height = 0;
++}
++
++static bool vulkan_init_rotation_resources(vk_t *vk)
++{
++   unsigned i;
++   const VkDevice device = vk->context->device;
++   /* Mesa-owned swapchain dimensions (portrait). */
++   const unsigned sw     = vk->context->swapchain_width;
++   const unsigned sh     = vk->context->swapchain_height;
++   /* Transposed = landscape, what RA renders into. */
++   const unsigned rw     = sh;
++   const unsigned rh     = sw;
++
++   vk->display_rot.width  = rw;
++   vk->display_rot.height = rh;
++
++   for (i = 0; i < vk->num_swapchain_images; i++)
++   {
++      VkImageCreateInfo ici;
++      VkMemoryAllocateInfo alloc;
++      VkMemoryRequirements mem_reqs;
++      VkImageViewCreateInfo view = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++      VkFramebufferCreateInfo fb = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++      struct vk_image *img       = &vk->display_rot.images[i];
++
++      memset(&ici, 0, sizeof(ici));
++      ici.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++      ici.imageType     = VK_IMAGE_TYPE_2D;
++      ici.format        = vk->context->swapchain_format;
++      ici.extent.width  = rw;
++      ici.extent.height = rh;
++      ici.extent.depth  = 1;
++      ici.mipLevels     = 1;
++      ici.arrayLayers   = 1;
++      ici.samples       = VK_SAMPLE_COUNT_1_BIT;
++      ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
++      ici.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
++                        | VK_IMAGE_USAGE_SAMPLED_BIT;
++      ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
++      ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      if (vkCreateImage(device, &ici, NULL, &img->image) != VK_SUCCESS)
++         goto fail;
++
++      vkGetImageMemoryRequirements(device, img->image, &mem_reqs);
++      memset(&alloc, 0, sizeof(alloc));
++      alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++      alloc.allocationSize  = mem_reqs.size;
++      alloc.memoryTypeIndex = vulkan_find_memory_type_fallback(
++            &vk->context->memory_properties,
++            mem_reqs.memoryTypeBits,
++            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
++      if (vkAllocateMemory(device, &alloc, NULL, &img->memory) != VK_SUCCESS)
++         goto fail;
++      vkBindImageMemory(device, img->image, img->memory, 0);
++
++      view.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
++      view.format                          = vk->context->swapchain_format;
++      view.image                           = img->image;
++      view.subresourceRange.baseMipLevel   = 0;
++      view.subresourceRange.baseArrayLayer = 0;
++      view.subresourceRange.levelCount     = 1;
++      view.subresourceRange.layerCount     = 1;
++      view.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
++      view.components.r                    = VK_COMPONENT_SWIZZLE_R;
++      view.components.g                    = VK_COMPONENT_SWIZZLE_G;
++      view.components.b                    = VK_COMPONENT_SWIZZLE_B;
++      view.components.a                    = VK_COMPONENT_SWIZZLE_A;
++      if (vkCreateImageView(device, &view, NULL, &img->view) != VK_SUCCESS)
++         goto fail;
++
++      /* Landscape framebuffer: main render pass renders into this. */
++      fb.renderPass      = vk->render_pass;
++      fb.attachmentCount = 1;
++      fb.pAttachments    = &img->view;
++      fb.width           = rw;
++      fb.height          = rh;
++      fb.layers          = 1;
++      if (vkCreateFramebuffer(device, &fb, NULL, &img->framebuffer)
++            != VK_SUCCESS)
++         goto fail;
++
++      /* Portrait framebuffer over the *real* backbuffer image-view, used
++       * only by the rotation pass. backbuffer view is already created at
++       * portrait dimensions by vulkan_init_framebuffers. */
++      {
++         VkFramebufferCreateInfo rfb = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++         rfb.renderPass      = vk->render_pass;
++         rfb.attachmentCount = 1;
++         rfb.pAttachments    = &vk->backbuffers[i].view;
++         rfb.width           = sw;
++         rfb.height          = sh;
++         rfb.layers          = 1;
++         if (vkCreateFramebuffer(device, &rfb, NULL,
++                  &vk->display_rot.real_fb[i]) != VK_SUCCESS)
++            goto fail;
++      }
++   }
++   return true;
++
++fail:
++   RARCH_ERR("[Vulkan] display_rot: resource allocation failed.\n");
++   vulkan_destroy_rotation_resources(vk);
++   return false;
++}
++
++/* Run the rotation pass: samples the landscape intermediate at
++ * display_rot.images[idx] and writes a fullscreen quad with rotated UVs
++ * into the portrait swapchain backbuffer.
++ *
++ * Built using the same helpers vulkan_draw_quad uses
++ * (vulkan_write_quad_descriptors writes binding 0 = UBO, binding 1 =
++ * sampler — VULKAN_WRITE_QUAD_VBO writes the 6-vertex quad). v1 used
++ * binding 2 by mistake which produced undefined sampling and ultimately
++ * caused vkQueuePresentKHR to reject the corrupt swapchain image.
++ */
++static void vulkan_run_rotation_pass(vk_t *vk, unsigned swapchain_index)
++{
++   VkRenderPassBeginInfo rp_info;
++   VkClearValue clear_color;
++   VkViewport vp;
++   VkRect2D sci;
++   VkDescriptorSet set;
++   struct vk_buffer_range ubo_range, vbo_range;
++   struct vk_image *src_img = &vk->display_rot.images[swapchain_index];
++   const unsigned sw        = vk->context->swapchain_width;
++   const unsigned sh        = vk->context->swapchain_height;
++   /* Synthetic vk_texture wrapping the intermediate, so we can pass it
++    * to vulkan_write_quad_descriptors which expects a vk_texture*. */
++   struct vk_texture src_tex;
++
++   /* Identity ortho [0,1] -> NDC, column-major to match the rest of the
++    * file's matrix conventions. */
++   static const math_matrix_4x4 ortho_mvp = {
++      { 2.0f,  0.0f, 0.0f, 0.0f,
++        0.0f,  2.0f, 0.0f, 0.0f,
++        0.0f,  0.0f, 1.0f, 0.0f,
++       -1.0f, -1.0f, 0.0f, 1.0f }
++   };
++
++   /* Transition src from COLOR_ATTACHMENT_OPTIMAL (where the main render
++    * pass left it via finalLayout) to SHADER_READ_ONLY_OPTIMAL. */
++   VULKAN_IMAGE_LAYOUT_TRANSITION(vk->cmd, src_img->image,
++         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++         VK_ACCESS_SHADER_READ_BIT,
++         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
++
++   /* Begin render pass into the *real* portrait backbuffer. */
++   memset(&rp_info, 0, sizeof(rp_info));
++   rp_info.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
++   rp_info.renderPass               = vk->render_pass;
++   rp_info.framebuffer              = vk->display_rot.real_fb[swapchain_index];
++   rp_info.renderArea.extent.width  = sw;
++   rp_info.renderArea.extent.height = sh;
++   rp_info.clearValueCount          = 1;
++   rp_info.pClearValues             = &clear_color;
++   clear_color.color.float32[0]     = 0.0f;
++   clear_color.color.float32[1]     = 0.0f;
++   clear_color.color.float32[2]     = 0.0f;
++   clear_color.color.float32[3]     = 1.0f;
++   vkCmdBeginRenderPass(vk->cmd, &rp_info, VK_SUBPASS_CONTENTS_INLINE);
++
++   /* Bind alpha_blend pipeline. Source has alpha=1.0 so blending is a
++    * straight copy; saves us from defining a dedicated opaque pipeline. */
++   vkCmdBindPipeline(vk->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++         vk->pipelines.alpha_blend);
++   vk->tracker.pipeline = vk->pipelines.alpha_blend;
++   vk->tracker.dirty   |= VULKAN_DIRTY_DYNAMIC_BIT;
++
++   /* Viewport / scissor at portrait swapchain dims. */
++   vp.x          = 0.0f;
++   vp.y          = 0.0f;
++   vp.width      = (float)sw;
++   vp.height     = (float)sh;
++   vp.minDepth   = 0.0f;
++   vp.maxDepth   = 1.0f;
++   sci.offset.x  = 0;
++   sci.offset.y  = 0;
++   sci.extent.width  = sw;
++   sci.extent.height = sh;
++   vkCmdSetViewport(vk->cmd, 0, 1, &vp);
++   vkCmdSetScissor (vk->cmd, 0, 1, &sci);
++
++   /* UBO: identity ortho. */
++   if (!vulkan_buffer_chain_alloc(vk->context, &vk->chain->ubo,
++            sizeof(ortho_mvp), &ubo_range))
++   {
++      vkCmdEndRenderPass(vk->cmd);
++      goto restore;
++   }
++   memcpy(ubo_range.data, &ortho_mvp, sizeof(ortho_mvp));
++
++   /* Synthesize a vk_texture that points at the intermediate, so the
++    * existing helper writes both binding 0 (UBO) and binding 1 (sampler)
++    * with the right contents. */
++   memset(&src_tex, 0, sizeof(src_tex));
++   src_tex.image  = src_img->image;
++   src_tex.view   = src_img->view;
++   src_tex.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++   src_tex.width  = vk->display_rot.width;
++   src_tex.height = vk->display_rot.height;
++   src_tex.format = vk->context->swapchain_format;
++
++   set = vulkan_descriptor_manager_alloc(vk->context->device,
++         &vk->chain->descriptor_manager);
++
++   vulkan_write_quad_descriptors(vk->context->device, set,
++         ubo_range.buffer, ubo_range.offset, sizeof(ortho_mvp),
++         &src_tex, vk->samplers.nearest);
++
++   vkCmdBindDescriptorSets(vk->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++         vk->pipelines.layout, 0, 1, &set, 0, NULL);
++
++   /* VBO: fullscreen quad with rotated UVs. The position quad is fixed
++    * at [0,1] x [0,1]; only UVs change with rotation.
++    *
++    * VULKAN_WRITE_QUAD_VBO(pv, x, y, w, h, tex_x, tex_y, tex_w, tex_h, color)
++    * lays out a 6-vertex quad with axis-aligned UVs. To rotate UVs, we
++    * negate the U or V span and shift the origin so that the visible
++    * region still maps [0,1] x [0,1] but in a rotated mapping.
++    *
++    * For 270° (the user's case) we want to swap U<->V mapping so that:
++    *   pos (x=0,y=0)  -> tex (u=0,v=1)
++    *   pos (x=1,y=0)  -> tex (u=0,v=0)
++    *   pos (x=0,y=1)  -> tex (u=1,v=1)
++    *   pos (x=1,y=1)  -> tex (u=1,v=0)
++    * VULKAN_WRITE_QUAD_VBO can't express this with simple offsets since
++    * it linearly interpolates (tex_x..tex_x+tex_w) across the quad's X
++    * axis — we need the rotation to put a *different* texture axis on
++    * the quad's X axis. So we write the 6 vertices manually here. */
++   if (!vulkan_buffer_chain_alloc(vk->context, &vk->chain->vbo,
++            6 * sizeof(struct vk_vertex), &vbo_range))
++   {
++      vkCmdEndRenderPass(vk->cmd);
++      goto restore;
++   }
++
++   {
++      struct vk_vertex *pv = (struct vk_vertex*)vbo_range.data;
++      struct vk_color color = { 1.0f, 1.0f, 1.0f, 1.0f };
++      float u_tl, v_tl, u_tr, v_tr, u_bl, v_bl, u_br, v_br;
++
++      switch (vk->display_rotation)
++      {
++         /* fbcon=rotate:1 — 90° on this panel mounting */
++         case 1:  u_tl=0; v_tl=1;  u_tr=0; v_tr=0;  u_bl=1; v_bl=1;  u_br=1; v_br=0; break;
++         /* fbcon=rotate:2 — 180° */
++         case 2:  u_tl=1; v_tl=1;  u_tr=0; v_tr=1;  u_bl=1; v_bl=0;  u_br=0; v_br=0; break;
++         /* fbcon=rotate:3 — 270° on this panel mounting (rk3576-class)
++          * Verified upright on RG Vita Pro / Knulli. If your panel comes
++          * out upside-down with this case, swap with case 1 above. */
++         case 3:  u_tl=1; v_tl=0;  u_tr=1; v_tr=1;  u_bl=0; v_bl=0;  u_br=0; v_br=1; break;
++         /* identity (shouldn't reach here — caller gates on display_rotation) */
++         default: u_tl=0; v_tl=0;  u_tr=1; v_tr=0;  u_bl=0; v_bl=1;  u_br=1; v_br=1; break;
++      }
++
++      pv[0].x = 0.0f; pv[0].y = 0.0f; pv[0].tex_x = u_tl; pv[0].tex_y = v_tl; pv[0].color = color;
++      pv[1].x = 1.0f; pv[1].y = 0.0f; pv[1].tex_x = u_tr; pv[1].tex_y = v_tr; pv[1].color = color;
++      pv[2].x = 0.0f; pv[2].y = 1.0f; pv[2].tex_x = u_bl; pv[2].tex_y = v_bl; pv[2].color = color;
++      pv[3].x = 1.0f; pv[3].y = 0.0f; pv[3].tex_x = u_tr; pv[3].tex_y = v_tr; pv[3].color = color;
++      pv[4].x = 1.0f; pv[4].y = 1.0f; pv[4].tex_x = u_br; pv[4].tex_y = v_br; pv[4].color = color;
++      pv[5].x = 0.0f; pv[5].y = 1.0f; pv[5].tex_x = u_bl; pv[5].tex_y = v_bl; pv[5].color = color;
++   }
++
++   vkCmdBindVertexBuffers(vk->cmd, 0, 1, &vbo_range.buffer, &vbo_range.offset);
++   vkCmdDraw(vk->cmd, 6, 1, 0, 0);
++   vkCmdEndRenderPass(vk->cmd);
++
++restore:
++   /* No trailing layout transition: the next frame's main render pass
++    * declares initialLayout = VK_IMAGE_LAYOUT_UNDEFINED on its color
++    * attachment (see the render-pass setup), so it discards the
++    * intermediate's current layout regardless of what we leave it in.
++    * Skipping the SHADER_READ → COLOR_ATTACHMENT_OPTIMAL barrier here
++    * saves a pipeline barrier per frame. */
++
++   /* Tracker state is invalid after our pipeline/descriptor/state changes. */
++   vk->tracker.pipeline = VK_NULL_HANDLE;
++   vk->tracker.view     = VK_NULL_HANDLE;
++   vk->tracker.sampler  = VK_NULL_HANDLE;
++   vk->tracker.dirty    = VULKAN_DIRTY_DYNAMIC_BIT;
++}
++
+ static void vulkan_init_framebuffers(
+       vk_t *vk)
+ {
+@@ -2337,6 +2713,19 @@
+       vkCreateFramebuffer(vk->context->device,
+             &info, NULL, &vk->backbuffers[i].framebuffer);
+    }
++
++   /* Rotation: allocate landscape intermediates + secondary framebuffers
++    * over the real backbuffer views. Recreated by vulkan_check_swapchain
++    * if dimensions change. */
++   if (vk->display_rotation)
++   {
++      if (!vulkan_init_rotation_resources(vk))
++      {
++         RARCH_ERR("[Vulkan] display_rot: init failed; "
++               "disabling rotation for this session.\n");
++         vk->display_rotation = 0;
++      }
++   }
+ }
+ 
+ static void vulkan_init_pipeline_layout(
+@@ -2973,6 +3362,10 @@
+ static void vulkan_deinit_framebuffers(vk_t *vk)
+ {
+    int i;
++   /* Destroy rotation resources first — they reference backbuffer views. */
++   if (vk->display_rotation)
++      vulkan_destroy_rotation_resources(vk);
++
+    for (i = 0; i < (int) vk->num_swapchain_images; i++)
+    {
+       if (vk->backbuffers[i].framebuffer)
+@@ -3551,6 +3944,15 @@
+    vk_t *vk                           = (vk_t*)calloc(1, sizeof(*vk));
+    if (!vk)
+       return NULL;
++
++   /* Display-rotation detection. Companion to khr_display_ctx.c which
++    * reports landscape dims to RA's outer layer when this is set. */
++   vk->display_rotation = vulkan_read_panel_rotation();
++   if (vk->display_rotation)
++      RARCH_LOG("[Vulkan] Panel rotation detected: %u° "
++            "(rendering to landscape intermediate)\n",
++            vk->display_rotation * 90);
++
+    ctx_driver                         = vulkan_get_context(vk, settings);
+    if (!ctx_driver)
+    {
+@@ -4643,6 +5045,11 @@
+    use_main_buffer                               =
+          ( vk->context->flags & VK_CTX_FLAG_HDR_ENABLE)
+       && (!filter_chain || !vulkan_filter_chain_emits_hdr10(filter_chain));
++   /* HDR + rotation interaction is non-trivial (would need to chain the
++    * HDR main_buffer through the rotation pass). For v2, force HDR's
++    * compositing path off when rotation is active. */
++   if (vk->display_rotation)
++      use_main_buffer = false;
+ #endif /* VULKAN_HDR_SWAPCHAIN */
+ 
+    /* Bookkeeping on start of frame. */
+@@ -4935,6 +5342,27 @@
+       backbuffer = &vk->main_buffer;
+ #endif /* VULKAN_HDR_SWAPCHAIN */
+ 
++   /* Display rotation: redirect main render pass to landscape intermediate.
++    *
++    * khr_display_ctx.c made RA's outer layer report landscape dims, so
++    * the local `width`/`height` and `vk->vp` are already landscape. We
++    * temporarily swap vk->context->swapchain_width/height to landscape
++    * too, so internal callsites that read those (e.g., the Y-flip in
++    * vulkan_set_viewport) compute against the correct attachment height.
++    * Restored before any WSI/present-bound code runs. */
++   unsigned saved_swapchain_w = 0, saved_swapchain_h = 0;
++   bool rot_active = (vk->display_rotation != 0)
++                  && (vk->display_rot.images[swapchain_index].framebuffer
++                        != VK_NULL_HANDLE);
++   if (rot_active)
++   {
++      saved_swapchain_w = vk->context->swapchain_width;
++      saved_swapchain_h = vk->context->swapchain_height;
++      vk->context->swapchain_width  = vk->display_rot.width;   /* landscape */
++      vk->context->swapchain_height = vk->display_rot.height;
++      backbuffer = &vk->display_rot.images[swapchain_index];
++   }
++
+    /* Render to backbuffer. */
+    if (     (backbuffer->image != VK_NULL_HANDLE)
+          && (vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN))
+@@ -5044,6 +5472,24 @@
+          vulkan_run_hdr_pipeline(vk->pipelines.hdr, vk->render_pass, &vk->main_buffer, backbuffer, vk);
+       }
+ #endif /* VULKAN_HDR_SWAPCHAIN */
++
++      /* Display rotation: restore portrait dims, then run rotation blit
++       * pass writing to the actual swapchain backbuffer. */
++      if (rot_active)
++      {
++         vk->context->swapchain_width  = saved_swapchain_w;
++         vk->context->swapchain_height = saved_swapchain_h;
++         backbuffer                    = &vk->backbuffers[swapchain_index];
++         vulkan_run_rotation_pass(vk, swapchain_index);
++      }
++   }
++   else if (rot_active)
++   {
++      /* Defensive: render-pass branch was skipped. Restore dims so any
++       * downstream code that reads vk->context dims sees portrait. */
++      vk->context->swapchain_width  = saved_swapchain_w;
++      vk->context->swapchain_height = saved_swapchain_h;
++      backbuffer                    = &vk->backbuffers[swapchain_index];
+    }
+ 
+    /* End the filter chain frame.

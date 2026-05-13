@@ -1,0 +1,401 @@
+diff --git a/gfx/drivers_context/drm_ctx.c b/gfx/drivers_context/drm_ctx.c
+--- a/gfx/drivers_context/drm_ctx.c
++++ b/gfx/drivers_context/drm_ctx.c
+@@ -34,6 +34,10 @@
+ #include <libdrm/drm.h>
+ #include <gbm.h>
+ 
++#ifdef HAVE_RGA_ROTATION
++#include <rga/RgaApi.h>
++#endif
++
+ #include <lists/dir_list.h>
+ #include <string/stdstring.h>
+ 
+@@ -116,6 +120,225 @@
+ static drmModeModeInfo gfx_ctx_crt_switch_mode;
+ static bool switch_mode                   = false;
+ 
++#ifdef HAVE_RGA_ROTATION
++#define DRM_RGA_BUFFERS_MAX 3
++#define DRM_RGA_SRC_CACHE   8
++
++typedef struct
++{
++   struct gbm_bo *bo;
++   int            fd;
++} drm_rga_src_fd_entry_t;
++
++static int            drm_rga_orientation                = 0;
++static rga_info_t     drm_rga_src                        = {0};
++static rga_info_t     drm_rga_dst                        = {0};
++static struct gbm_bo *drm_rga_bufs[DRM_RGA_BUFFERS_MAX] = {NULL, NULL, NULL};
++static int            drm_rga_fds[DRM_RGA_BUFFERS_MAX]  = {-1, -1, -1};
++static int            drm_rga_idx                        = 0;
++static unsigned       drm_rga_buf_w                      = 0;
++static unsigned       drm_rga_buf_h                      = 0;
++static bool           drm_rga_ready                      = false;
++/* Cache of dma-buf fds exported from source GBM BOs. gbm_bo_get_fd() is
++ * a drmPrimeHandleToFD ioctl; GBM cycles the same 2-3 BOs across frames
++ * so we cache by BO pointer to avoid a syscall per frame. Flushed when
++ * the gbm_surface is recreated (drm_rga_init). */
++static drm_rga_src_fd_entry_t drm_rga_src_fd_cache[DRM_RGA_SRC_CACHE];
++
++static int drm_rga_get_rotation(void)
++{
++   FILE *fp = fopen("/proc/cmdline", "r");
++   char buf[4096], *p;
++   int r = 0;
++   if (!fp)
++      return 0;
++   if (fgets(buf, sizeof(buf), fp))
++   {
++      p = strstr(buf, "fbcon=rotate:");
++      if (p)
++      {
++         p += 13;
++         r  = atoi(p);
++         if (r < 0 || r > 3)
++            r = 0;
++      }
++   }
++   fclose(fp);
++   return r;
++}
++
++static void drm_rga_src_cache_flush(void)
++{
++   unsigned i;
++   for (i = 0; i < DRM_RGA_SRC_CACHE; i++)
++   {
++      /* bo==NULL is the canonical "empty slot" marker. We test it
++       * rather than fd>=0 because BSS zero-init gives fd=0 (stdin),
++       * and close(0) would be catastrophic. */
++      if (drm_rga_src_fd_cache[i].bo != NULL)
++      {
++         if (drm_rga_src_fd_cache[i].fd >= 0)
++            close(drm_rga_src_fd_cache[i].fd);
++         drm_rga_src_fd_cache[i].bo = NULL;
++         drm_rga_src_fd_cache[i].fd = -1;
++      }
++   }
++}
++
++static int drm_rga_src_cache_get(struct gbm_bo *bo)
++{
++   unsigned i;
++   int slot = -1;
++   for (i = 0; i < DRM_RGA_SRC_CACHE; i++)
++   {
++      if (drm_rga_src_fd_cache[i].bo == bo)
++         return drm_rga_src_fd_cache[i].fd;
++      if (slot < 0 && drm_rga_src_fd_cache[i].bo == NULL)
++         slot = (int)i;
++   }
++   if (slot < 0)
++   {
++      /* All 8 slots occupied by live BOs. Shouldn't happen — GBM
++       * surfaces cycle 2-3 BOs — but evict slot 0 as a safety valve. */
++      if (drm_rga_src_fd_cache[0].fd >= 0)
++         close(drm_rga_src_fd_cache[0].fd);
++      slot = 0;
++   }
++   drm_rga_src_fd_cache[slot].bo = bo;
++   drm_rga_src_fd_cache[slot].fd = gbm_bo_get_fd(bo);
++   return drm_rga_src_fd_cache[slot].fd;
++}
++
++static void drm_rga_cleanup(void)
++{
++   unsigned i;
++   drm_rga_src_cache_flush();
++   if (!drm_rga_ready)
++      return;
++   for (i = 0; i < DRM_RGA_BUFFERS_MAX; i++)
++   {
++      if (drm_rga_fds[i] >= 0)
++      {
++         close(drm_rga_fds[i]);
++         drm_rga_fds[i] = -1;
++      }
++      if (drm_rga_bufs[i])
++      {
++         gbm_bo_destroy(drm_rga_bufs[i]);
++         drm_rga_bufs[i] = NULL;
++      }
++   }
++   c_RkRgaDeInit();
++   drm_rga_buf_w = 0;
++   drm_rga_buf_h = 0;
++   drm_rga_ready = false;
++}
++
++static void drm_rga_init(struct gbm_device *dev, unsigned sw, unsigned sh)
++{
++   unsigned i;
++   uint32_t ds;
++
++   /* Every call to set_video_mode() recreates drm->gbm_surface, which
++    * means the src BO pointers we've cached are about to be freed.
++    * Flush unconditionally — cheap if the cache is empty. */
++   drm_rga_src_cache_flush();
++
++   /* If already initialized for the same scanout size, reuse. Otherwise
++    * tear down and re-init at the new size. This is essential because
++    * set_video_mode() is called again every time a core loads with
++    * different dimensions. */
++   if (drm_rga_ready && drm_rga_buf_w == sw && drm_rga_buf_h == sh)
++      return;
++
++   if (drm_rga_ready)
++      drm_rga_cleanup();
++
++   c_RkRgaInit();
++
++   for (i = 0; i < DRM_RGA_BUFFERS_MAX; i++)
++   {
++      drm_rga_bufs[i] = gbm_bo_create(dev, sw, sh,
++            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
++      if (!drm_rga_bufs[i])
++      {
++         RARCH_ERR("[KMS/RGA] Failed to create rotation buffer %u\n", i);
++         drm_rga_ready = false;
++         return;
++      }
++      drm_rga_fds[i] = gbm_bo_get_fd(drm_rga_bufs[i]);
++   }
++   drm_rga_idx   = 0;
++   drm_rga_buf_w = sw;
++   drm_rga_buf_h = sh;
++
++   memset(&drm_rga_src, 0, sizeof(drm_rga_src));
++   drm_rga_src.mmuFlag = 1;
++   switch (drm_rga_orientation)
++   {
++      case 1: drm_rga_src.rotation = HAL_TRANSFORM_ROT_90;  break;
++      case 2: drm_rga_src.rotation = HAL_TRANSFORM_ROT_180; break;
++      case 3: drm_rga_src.rotation = HAL_TRANSFORM_ROT_270; break;
++      default: break;
++   }
++
++   /* All 3 dst BOs are allocated with identical arguments on the same
++    * device, so they share width/height/stride. Configure drm_rga_dst
++    * once here; per-blit we only update drm_rga_dst.fd. */
++   memset(&drm_rga_dst, 0, sizeof(drm_rga_dst));
++   drm_rga_dst.mmuFlag = 1;
++   ds                  = gbm_bo_get_stride(drm_rga_bufs[0]);
++   rga_set_rect(&drm_rga_dst.rect, 0, 0, sw, sh, ds / 4, sh, RK_FORMAT_BGRA_8888);
++
++   drm_rga_ready = true;
++   RARCH_LOG("[KMS/RGA] Rotation initialized: %u° (scanout %ux%u)\n",
++         drm_rga_orientation * 90, sw, sh);
++}
++
++static struct drm_fb *drm_fb_get_from_bo(struct gbm_bo *bo);
++
++static struct drm_fb *drm_rga_rotate(struct gbm_bo *src_bo)
++{
++   int ret;
++   struct drm_fb *fb;
++   struct gbm_bo *dst_bo = drm_rga_bufs[drm_rga_idx];
++   uint32_t w  = gbm_bo_get_width(src_bo);
++   uint32_t h  = gbm_bo_get_height(src_bo);
++   uint32_t s  = gbm_bo_get_stride(src_bo);
++
++   /* Src rect: cheap field writes, do each frame. Source dims are
++    * invariant for a given gbm_surface lifetime but we don't gain
++    * measurably by caching. */
++   rga_set_rect(&drm_rga_src.rect, 0, 0, w, h, s / 4, h, RK_FORMAT_BGRA_8888);
++
++   /* Per-frame: only the fds vary. Dst rect and flags were set at init.
++    * Src fd comes from a BO-indexed cache so we avoid a drmPrimeHandleToFD
++    * ioctl + close() syscall pair every frame. */
++   drm_rga_src.fd = drm_rga_src_cache_get(src_bo);
++   drm_rga_dst.fd = drm_rga_fds[drm_rga_idx];
++
++   ret = c_RkRgaBlit(&drm_rga_src, &drm_rga_dst, NULL);
++   if (ret < 0)
++   {
++      RARCH_ERR("[KMS/RGA] blit failed (ret=%d, src=%ux%u, rot=%d)\n",
++            ret, w, h, drm_rga_src.rotation);
++      /* Don't return a stale buffer — callers treat NULL as "skip flip". */
++      return NULL;
++   }
++
++   /* Reuse the cached drm_fb attached to the dst BO's user_data instead
++    * of re-creating via drm_fb_get_from_bo() every frame. After the first
++    * cycle of DRM_RGA_BUFFERS_MAX frames this is just a pointer fetch and
++    * we avoid drmModeAddFB/drmModeRmFB ioctl pairs per frame. */
++   fb = (struct drm_fb*)gbm_bo_get_user_data(dst_bo);
++   if (!fb)
++      fb = drm_fb_get_from_bo(dst_bo);
++
++   drm_rga_idx = (drm_rga_idx + 1) % DRM_RGA_BUFFERS_MAX;
++   return fb;
++}
++#endif /* HAVE_RGA_ROTATION */
++
+ static float mode_vrefresh(drmModeModeInfo *mode)
+ {
+    return  mode->clock * 1000.00f / (mode->htotal * mode->vtotal);
+@@ -519,8 +742,18 @@
+ {
+    *resize = false;
+    *quit   = (bool)frontend_driver_get_signal_handler_state();
+-   *width = g_drm_mode->hdisplay;
+-   *height = g_drm_mode->vdisplay;
++#ifdef HAVE_RGA_ROTATION
++   if (drm_rga_orientation & 1)
++   {
++      *width  = g_drm_mode->vdisplay;
++      *height = g_drm_mode->hdisplay;
++   }
++   else
++#endif
++   {
++      *width  = g_drm_mode->hdisplay;
++      *height = g_drm_mode->vdisplay;
++   }
+ }
+ 
+ static void drm_flip_handler(int fd, unsigned frame,
+@@ -563,10 +796,28 @@
+    struct drm_fb *fb = NULL;
+ 
+    drm->next_bo      = gbm_surface_lock_front_buffer(drm->gbm_surface);
+-   fb                = (struct drm_fb*)gbm_bo_get_user_data(drm->next_bo);
++#ifdef HAVE_RGA_ROTATION
++   if (drm_rga_ready)
++      fb             = drm_rga_rotate(drm->next_bo);
++   else
++#endif
++   {
++      fb             = (struct drm_fb*)gbm_bo_get_user_data(drm->next_bo);
++      if (!fb)
++         fb          = (struct drm_fb*)drm_fb_get_from_bo(drm->next_bo);
++   }
+ 
+    if (!fb)
+-      fb             = (struct drm_fb*)drm_fb_get_from_bo(drm->next_bo);
++   {
++      /* RGA blit failed or drm_fb_get_from_bo() failed. Release the
++       * locked front buffer — leaving it locked starves the GBM pool
++       * and eventually gbm_surface_has_free_buffers() returns false
++       * permanently. The flip is skipped; the previously-displayed
++       * buffer stays on screen until the next successful frame. */
++      gbm_surface_release_buffer(drm->gbm_surface, drm->next_bo);
++      drm->next_bo = NULL;
++      return false;
++   }
+ 
+    if (switch_mode)
+    {
+@@ -708,6 +959,10 @@
+    egl_destroy(&drm->egl);
+ #endif
+ 
++#ifdef HAVE_RGA_ROTATION
++   drm_rga_cleanup();
++#endif
++
+    free_drm_resources(drm);
+ 
+    g_drm_mode          = NULL;
+@@ -805,6 +1060,25 @@
+       goto nextgpu;
+    }
+ 
++#ifdef HAVE_RGA_ROTATION
++   drm_rga_orientation = drm_rga_get_rotation();
++   if (drm_rga_orientation)
++   {
++      RARCH_LOG("[KMS/RGA] Panel rotation detected: %u°\n",
++            drm_rga_orientation * 90);
++      /* Swap fb dimensions now so get_video_size() returns portrait
++       * before set_video_mode() is called. The GL video driver reads
++       * this to set up its viewport/scaling, so it must be correct
++       * from the start. */
++      if (drm_rga_orientation & 1)
++      {
++         unsigned tmp   = drm->fb_width;
++         drm->fb_width  = drm->fb_height;
++         drm->fb_height = tmp;
++      }
++   }
++#endif
++
+    dir_list_free(gpu_descriptors);
+ 
+    /* Setup the flip handler. */
+@@ -895,9 +1169,17 @@
+             float diff;
+             mode                   = &g_drm_connector->modes[i];
+ 
+-            if (   (width  != mode->hdisplay)
+-                || (height != mode->vdisplay))
+-               continue;
++            {
++#ifdef HAVE_RGA_ROTATION
++               unsigned mw = (drm_rga_orientation & 1) ? mode->vdisplay : mode->hdisplay;
++               unsigned mh = (drm_rga_orientation & 1) ? mode->hdisplay : mode->vdisplay;
++#else
++               unsigned mw = mode->hdisplay;
++               unsigned mh = mode->vdisplay;
++#endif
++               if (width != mw || height != mh)
++                  continue;
++            }
+ 
+             mode_vrefresh          = drm_calc_refresh_rate(mode);
+             diff                   = fabsf(refresh_mod * mode_vrefresh - video_refresh_rate);
+@@ -913,14 +1195,24 @@
+ 
+    if (!g_drm_mode)
+    {
+-      RARCH_ERR("[KMS] Did not find suitable video mode for %ux%u.\n",
++      RARCH_WARN("[KMS] No exact mode for %ux%u, falling back to mode 0.\n",
+             width, height);
+-      goto error;
++      g_drm_mode = &g_drm_connector->modes[0];
+    }
+ 
+    drm->fb_width                   = g_drm_mode->hdisplay;
+    drm->fb_height                  = g_drm_mode->vdisplay;
+ 
++#ifdef HAVE_RGA_ROTATION
++   if (drm_rga_orientation > 0)
++   {
++      drm_rga_init(drm->gbm_dev, g_drm_mode->hdisplay, g_drm_mode->vdisplay);
++      /* GBM surface rendered at portrait dimensions; RGA rotates to scanout */
++      drm->fb_width  = g_drm_mode->vdisplay;
++      drm->fb_height = g_drm_mode->hdisplay;
++   }
++#endif
++
+    /* Create GBM surface. */
+    drm->gbm_surface                = gbm_surface_create(
+          drm->gbm_dev,
+@@ -942,8 +1234,21 @@
+ 
+    drm->bo   = gbm_surface_lock_front_buffer(drm->gbm_surface);
+ 
+-   if (!(fb = (struct drm_fb*)gbm_bo_get_user_data(drm->bo)))
+-      fb     = drm_fb_get_from_bo(drm->bo);
++#ifdef HAVE_RGA_ROTATION
++   if (drm_rga_ready)
++      fb     = drm_rga_rotate(drm->bo);
++   else
++#endif
++   {
++      if (!(fb = (struct drm_fb*)gbm_bo_get_user_data(drm->bo)))
++         fb  = drm_fb_get_from_bo(drm->bo);
++   }
++
++   if (!fb)
++   {
++      RARCH_ERR("[KMS] Failed to acquire initial framebuffer.\n");
++      goto error;
++   }
+ 
+    if ((ret  = drmModeSetCrtc(g_drm_fd,
+          g_crtc_id, fb->fb_id, 0, 0, &g_connector_id, 1, g_drm_mode)) < 0)
