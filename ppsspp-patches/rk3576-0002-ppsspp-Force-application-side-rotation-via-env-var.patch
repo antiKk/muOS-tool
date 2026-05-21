@@ -1,0 +1,335 @@
+From: muOS Developer
+Date: Sat, 9 May 2026 00:00:00 +0000
+Subject: [PATCH] Force application-side display rotation via PPSSPP_DISPLAY_ROTATION
+
+Some Mali Vulkan drivers using VK_KHR_display (e.g. Rockchip rk3576)
+report only VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR in surfCapabilities_,
+even when the panel is physically mounted rotated 90/180/270 degrees and
+the application must compensate.  These drivers also fix the surface
+extent at the panel-natural resolution (min == max == currentExtent),
+making the standard ARM "surface rotation" pattern (where preTransform
+and a swapped swapchain extent let the driver handle rotation) unusable.
+
+This patch lets the user force application-side rotation via the
+environment variable PPSSPP_DISPLAY_ROTATION (values: 0, 90, 180, 270).
+When set, PPSSPP's existing rotation infrastructure (g_display.rotation,
+RotateRectToDisplay, the rotated curWidth/curHeight handling in
+VulkanRenderManager) is engaged regardless of what the driver advertises.
+
+To support drivers that won't accept rotated swapchain extents, the
+"backbuffer dimensions" exposed to the UI layer are split from the actual
+"swapchain image dimensions" used for VkImage resource sizing:
+
+  GetBackbufferWidth/Height       -> swapChainExtent_     (logical/post-rotation)
+  GetSwapchainImageWidth/Height   -> swapchainImageExtent_ (physical/native)
+
+In the normal case (no rotation, or driver-side rotation on Android) both
+extents are kept in sync and the new getters return identical values; the
+existing rotation block now swaps both extents together, so the existing
+Android path is preserved.  Under PPSSPP_DISPLAY_ROTATION only
+swapChainExtent_ is swapped, so the UI lays out for the logical landscape
+size while VkImage objects (swapchain images, depth buffer, framebuffer,
+backbuffer renderpass area, RotateRectToDisplay destination dims) all
+continue to use the physical panel-native size that the driver enforces.
+
+VulkanRenderManager's curWidth_/curHeight_ derivation has to handle both
+arrangements: when driver-side rotation is in effect, swapchain image dims
+match the post-rotation logical dims and the existing swap is correct;
+when application-side rotation is in effect, swapchain images stay at
+physical dims while GetBackbufferWidth/Height already report logical dims
+(already "swapped"), so the swap must NOT be repeated.  The patch detects
+this by comparing GetBackbufferWidth/Height vs GetSwapchainImageWidth/
+Height -- if they differ, application-side rotation is active and the
+swap is skipped, so renderArea ends up at the correct logical dims that
+RotateRectToDisplay then maps onto the physical swapchain image.
+
+Usage example for rk3576 with fbcon=rotate:3 and a panel mounted rotated
+90 degrees:
+
+  export SDL_KMSDRM_ORIENTATION=0      # SDL hands PPSSPP a portrait window
+  export PPSSPP_DISPLAY_ROTATION=270   # PPSSPP rotates render output 270 CW
+  /path/to/PPSSPP
+
+The matching SDL2 patch in the muOS tree skips RGA rotation for Vulkan
+windows; this PPSSPP patch is what produces a correctly-oriented landscape
+display (UI + game) on a rotated portrait panel.
+
+Files modified:
+  Common/GPU/Vulkan/VulkanContext.h           (new field, new getters)
+  Common/GPU/Vulkan/VulkanContext.cpp         (env var override, sync logic)
+  Common/GPU/Vulkan/VulkanQueueRunner.cpp     (use physical dims internally)
+  Common/GPU/Vulkan/VulkanRenderManager.cpp   (curWidth/curHeight handling,
+                                               framebuffer creation)
+---
+diff -urpN a/Common/GPU/Vulkan/VulkanContext.cpp b/Common/GPU/Vulkan/VulkanContext.cpp
+--- a/Common/GPU/Vulkan/VulkanContext.cpp	2026-05-09 23:34:27.445146341 +0000
++++ b/Common/GPU/Vulkan/VulkanContext.cpp	2026-05-09 23:35:49.879130915 +0000
+@@ -1391,6 +1391,7 @@ bool VulkanContext::InitSwapchain(VkPres
+ 	if (surfCapabilities_.maxImageExtent.width == 0 || surfCapabilities_.maxImageExtent.height == 0) {
+ 		WARN_LOG(Log::G3D, "Max image extent is 0 - app is probably minimized. Faking having a swapchain.");
+ 		swapChainExtent_ = {};  // makes it so querying width/height returns 0.
++		swapchainImageExtent_ = {};
+ 		// We pretend to have a swapchain initialized - though we won't actually render to it.
+ 		swapchainInited_ = true;
+ 		return true;
+@@ -1413,6 +1414,12 @@ bool VulkanContext::InitSwapchain(VkPres
+ 	swapChainExtent_.width = clamp(currentExtent.width, surfCapabilities_.minImageExtent.width, surfCapabilities_.maxImageExtent.width);
+ 	swapChainExtent_.height = clamp(currentExtent.height, surfCapabilities_.minImageExtent.height, surfCapabilities_.maxImageExtent.height);
+ 
++	// By default the actual swapchain image extent matches the backbuffer extent.
++	// The existing driver-rotation block below may swap both together; the
++	// PPSSPP_DISPLAY_ROTATION override (added further down) only swaps the
++	// backbuffer extent and leaves swapchainImageExtent_ at the physical size.
++	swapchainImageExtent_ = swapChainExtent_;
++
+ 	INFO_LOG(Log::G3D, "surfCapabilities_.current: %dx%d min: %dx%d max: %dx%d computed: %dx%d",
+ 		currentExtent.width, currentExtent.height,
+ 		surfCapabilities_.minImageExtent.width, surfCapabilities_.minImageExtent.height,
+@@ -1479,6 +1486,7 @@ bool VulkanContext::InitSwapchain(VkPres
+ 			g_display.rotation = DisplayRotation::ROTATE_90;
+ 			g_display.rot_matrix.setRotationZ90();
+ 			std::swap(swapChainExtent_.width, swapChainExtent_.height);
++			std::swap(swapchainImageExtent_.width, swapchainImageExtent_.height);
+ 			break;
+ 		case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+ 			g_display.rotation = DisplayRotation::ROTATE_180;
+@@ -1488,6 +1496,7 @@ bool VulkanContext::InitSwapchain(VkPres
+ 			g_display.rotation = DisplayRotation::ROTATE_270;
+ 			g_display.rot_matrix.setRotationZ270();
+ 			std::swap(swapChainExtent_.width, swapChainExtent_.height);
++			std::swap(swapchainImageExtent_.width, swapchainImageExtent_.height);
+ 			break;
+ 		default:
+ 			_dbg_assert_(false);
+@@ -1497,6 +1506,53 @@ bool VulkanContext::InitSwapchain(VkPres
+ 		preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+ 	}
+ 
++	// === muOS rk3576 (and similar): force application-side rotation ===
++	// On some Mali Vulkan drivers using VK_KHR_display, the driver advertises
++	// only IDENTITY in supportedTransforms / currentTransform even on physically
++	// rotated panels. Setting PPSSPP_DISPLAY_ROTATION=90/180/270 forces the
++	// renderer to pre-rotate UI and game content so it appears correctly.
++	//
++	// Critically, swapchainImageExtent_ is left UN-swapped here: those are the
++	// dimensions of the actual VkImage objects used for the swapchain, and the
++	// surface refuses any extent other than the natural panel size.  Only
++	// swapChainExtent_ (the dimensions exposed to the UI via GetBackbufferWidth/
++	// Height) gets swapped, so PPSSPP lays out for landscape while drawing into
++	// portrait swapchain images. Internal Vulkan resource sizing in
++	// VulkanQueueRunner uses GetSwapchainImageWidth/Height to stay consistent
++	// with the real images.
++	{
++		const char *forceRotation = getenv("PPSSPP_DISPLAY_ROTATION");
++		if (forceRotation && *forceRotation) {
++			int rot = atoi(forceRotation);
++			g_display.rot_matrix.setIdentity();
++			switch (rot) {
++			case 90:
++				g_display.rotation = DisplayRotation::ROTATE_90;
++				g_display.rot_matrix.setRotationZ90();
++				std::swap(swapChainExtent_.width, swapChainExtent_.height);
++				break;
++			case 180:
++				g_display.rotation = DisplayRotation::ROTATE_180;
++				g_display.rot_matrix.setRotationZ180();
++				break;
++			case 270:
++				g_display.rotation = DisplayRotation::ROTATE_270;
++				g_display.rot_matrix.setRotationZ270();
++				std::swap(swapChainExtent_.width, swapChainExtent_.height);
++				break;
++			case 0:
++				g_display.rotation = DisplayRotation::ROTATE_0;
++				break;
++			default:
++				WARN_LOG(Log::G3D, "PPSSPP_DISPLAY_ROTATION=%s ignored (use 0/90/180/270)", forceRotation);
++				break;
++			}
++			INFO_LOG(Log::G3D, "PPSSPP_DISPLAY_ROTATION=%d: backbuffer=%dx%d swapchainImage=%dx%d",
++				rot, swapChainExtent_.width, swapChainExtent_.height,
++				swapchainImageExtent_.width, swapchainImageExtent_.height);
++		}
++	}
++
+ 	// Only log transforms if relevant.
+ 	if (surfCapabilities_.supportedTransforms != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+ 		std::string preTransformStr = surface_transforms_to_string(preTransform);
+@@ -1512,6 +1568,7 @@ bool VulkanContext::InitSwapchain(VkPres
+ 			// To keep the size consistent even with pretransform, do this after the swap. Should be fine.
+ 			// This is fixed in newer PowerVR drivers but I don't know the cutoff.
+ 			swapChainExtent_.width &= ~31;
++			swapchainImageExtent_.width &= ~31;
+ 
+ 			// TODO: Also modify display_xres/display_yres appropriately for scissors to match.
+ 			// This will get a bit messy. Ideally we should remove that logic from app-android.cpp
+@@ -1528,8 +1585,10 @@ bool VulkanContext::InitSwapchain(VkPres
+ 	swap_chain_info.minImageCount = desiredNumberOfSwapChainImages;
+ 	swap_chain_info.imageFormat = swapchainFormat_;
+ 	swap_chain_info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+-	swap_chain_info.imageExtent.width = swapChainExtent_.width;
+-	swap_chain_info.imageExtent.height = swapChainExtent_.height;
++	// Use the physical extent for actual VkImage creation. In the normal/Android
++	// path this equals swapChainExtent_; under PPSSPP_DISPLAY_ROTATION it differs.
++	swap_chain_info.imageExtent.width = swapchainImageExtent_.width;
++	swap_chain_info.imageExtent.height = swapchainImageExtent_.height;
+ 	swap_chain_info.preTransform = preTransform;
+ 	swap_chain_info.imageArrayLayers = 1;
+ 	swap_chain_info.presentMode = swapchainPresentMode;
+diff -urpN a/Common/GPU/Vulkan/VulkanContext.h b/Common/GPU/Vulkan/VulkanContext.h
+--- a/Common/GPU/Vulkan/VulkanContext.h	2026-05-09 23:34:27.449146341 +0000
++++ b/Common/GPU/Vulkan/VulkanContext.h	2026-05-09 23:34:47.318261846 +0000
+@@ -380,6 +380,18 @@ public:
+ 	int GetBackbufferWidth() { return (int)swapChainExtent_.width; }
+ 	int GetBackbufferHeight() { return (int)swapChainExtent_.height; }
+ 
++	// Physical swapchain image dimensions.  Equal to GetBackbufferWidth/Height
++	// in the normal case (driver-side rotation, or no rotation at all).  When
++	// PPSSPP_DISPLAY_ROTATION is used to force application-side rotation while
++	// the surface forbids extent changes (e.g. Mali VK_KHR_display on rk3576),
++	// the backbuffer dimensions exposed to the UI are the LOGICAL/post-rotation
++	// dimensions, while these getters return the PHYSICAL dimensions of the
++	// actual VkImage objects.  Internal Vulkan resource sizing (depth buffer,
++	// backbuffer render-pass area, RotateRectToDisplay destination) must use
++	// these to stay consistent with the real swapchain images.
++	int GetSwapchainImageWidth() { return (int)swapchainImageExtent_.width; }
++	int GetSwapchainImageHeight() { return (int)swapchainImageExtent_.height; }
++
+ 	void SetProfilerEnabledPtr(bool *enabled) {
+ 		for (auto &frame : frame_) {
+ 			frame.profiler.SetEnabledPtr(enabled);
+@@ -500,6 +512,10 @@ private:
+ 
+ 	// Swap chain extent
+ 	VkExtent2D swapChainExtent_{};
++	// Actual VkImage extent for the swapchain images.  Differs from swapChainExtent_
++	// only when application-side rotation is forced (PPSSPP_DISPLAY_ROTATION) on a
++	// surface that won't accept rotated extents.
++	VkExtent2D swapchainImageExtent_{};
+ 
+ 	VulkanContext::CreateInfo createInfo_{};
+ 
+diff -urpN a/Common/GPU/Vulkan/VulkanQueueRunner.cpp b/Common/GPU/Vulkan/VulkanQueueRunner.cpp
+--- a/Common/GPU/Vulkan/VulkanQueueRunner.cpp	2026-05-09 23:34:27.454035310 +0000
++++ b/Common/GPU/Vulkan/VulkanQueueRunner.cpp	2026-05-09 23:37:27.025393762 +0000
+@@ -113,8 +113,8 @@ bool VulkanQueueRunner::InitDepthStencil
+ 	VkImageCreateInfo image_info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+ 	image_info.imageType = VK_IMAGE_TYPE_2D;
+ 	image_info.format = depth_format;
+-	image_info.extent.width = vulkan_->GetBackbufferWidth();
+-	image_info.extent.height = vulkan_->GetBackbufferHeight();
++	image_info.extent.width = vulkan_->GetSwapchainImageWidth();
++	image_info.extent.height = vulkan_->GetSwapchainImageHeight();
+ 	image_info.extent.depth = 1;
+ 	image_info.mipLevels = 1;
+ 	image_info.arrayLayers = 1;
+@@ -704,8 +704,8 @@ std::string VulkanQueueRunner::StepToStr
+ 	switch (step.stepType) {
+ 	case VKRStepType::RENDER:
+ 	{
+-		int w = step.render.framebuffer ? step.render.framebuffer->width : vulkan->GetBackbufferWidth();
+-		int h = step.render.framebuffer ? step.render.framebuffer->height : vulkan->GetBackbufferHeight();
++		int w = step.render.framebuffer ? step.render.framebuffer->width : vulkan->GetSwapchainImageWidth();
++		int h = step.render.framebuffer ? step.render.framebuffer->height : vulkan->GetSwapchainImageHeight();
+ 		int actual_w = step.render.renderArea.extent.width;
+ 		int actual_h = step.render.renderArea.extent.height;
+ 		const char *renderCmd = GetRPTypeName(step.render.renderPassType);
+@@ -884,8 +884,8 @@ const char *ImageLayoutToString(VkImageL
+ void VulkanQueueRunner::LogRenderPass(const VKRStep &pass, bool verbose) {
+ 	const auto &r = pass.render;
+ 	const char *framebuf = r.framebuffer ? r.framebuffer->Tag() : "backbuffer";
+-	int w = r.framebuffer ? r.framebuffer->width : vulkan_->GetBackbufferWidth();
+-	int h = r.framebuffer ? r.framebuffer->height : vulkan_->GetBackbufferHeight();
++	int w = r.framebuffer ? r.framebuffer->width : vulkan_->GetSwapchainImageWidth();
++	int h = r.framebuffer ? r.framebuffer->height : vulkan_->GetSwapchainImageHeight();
+ 
+ 	INFO_LOG(Log::G3D, "RENDER %s Begin(%s, draws: %d, %dx%d, %s, %s, %s)", pass.tag, framebuf, r.numDraws, w, h, RenderPassActionName(r.colorLoad), RenderPassActionName(r.depthLoad), RenderPassActionName(r.stencilLoad));
+ 	// TODO: Log these in detail.
+@@ -1028,8 +1028,8 @@ void VulkanQueueRunner::PerformRenderPas
+ 	// NOTE: Unconditionally flushes recordBarrier_.
+ 	VKRRenderPass *renderPass = PerformBindFramebufferAsRenderTarget(step, cmd);
+ 
+-	int curWidth = step.render.framebuffer ? step.render.framebuffer->width : vulkan_->GetBackbufferWidth();
+-	int curHeight = step.render.framebuffer ? step.render.framebuffer->height : vulkan_->GetBackbufferHeight();
++	int curWidth = step.render.framebuffer ? step.render.framebuffer->width : vulkan_->GetSwapchainImageWidth();
++	int curHeight = step.render.framebuffer ? step.render.framebuffer->height : vulkan_->GetSwapchainImageHeight();
+ 
+ 	VKRFramebuffer *fb = step.render.framebuffer;
+ 
+@@ -1119,7 +1119,7 @@ void VulkanQueueRunner::PerformRenderPas
+ 			} else {
+ 				const VkViewport &vp = c.viewport.vp;
+ 				DisplayRect<float> rc{ vp.x, vp.y, vp.width, vp.height };
+-				RotateRectToDisplay(rc, (float)vulkan_->GetBackbufferWidth(), (float)vulkan_->GetBackbufferHeight());
++				RotateRectToDisplay(rc, (float)vulkan_->GetSwapchainImageWidth(), (float)vulkan_->GetSwapchainImageHeight());
+ 				VkViewport final_vp;
+ 				final_vp.x = rc.x;
+ 				final_vp.y = rc.y;
+@@ -1139,7 +1139,7 @@ void VulkanQueueRunner::PerformRenderPas
+ 				// Rendering to backbuffer. Might need to rotate.
+ 				const VkRect2D &rc = c.scissor.scissor;
+ 				DisplayRect<int> rotated_rc{ rc.offset.x, rc.offset.y, (int)rc.extent.width, (int)rc.extent.height };
+-				RotateRectToDisplay(rotated_rc, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
++				RotateRectToDisplay(rotated_rc, vulkan_->GetSwapchainImageWidth(), vulkan_->GetSwapchainImageHeight());
+ 				_dbg_assert_(rotated_rc.x >= 0);
+ 				_dbg_assert_(rotated_rc.y >= 0);
+ 				VkRect2D finalRect = VkRect2D{ { rotated_rc.x, rotated_rc.y }, { (uint32_t)rotated_rc.w, (uint32_t)rotated_rc.h} };
+@@ -1346,9 +1346,9 @@ VKRRenderPass *VulkanQueueRunner::Perfor
+ 		renderPass = GetRenderPass(key);
+ 		framebuf = backbuffer_;
+ 
+-		// Raw, rotated backbuffer size.
+-		w = vulkan_->GetBackbufferWidth();
+-		h = vulkan_->GetBackbufferHeight();
++		// Raw backbuffer size = physical swapchain image dims.
++		w = vulkan_->GetSwapchainImageWidth();
++		h = vulkan_->GetSwapchainImageHeight();
+ 
+ 		Uint8x4ToFloat4(clearVal[0].color.float32, step.render.clearColor);
+ 		numClearVals = hasDepth ? 2 : 1;  // We might do depth-less backbuffer in the future, though doubtful of the value.
+@@ -1365,7 +1365,7 @@ VKRRenderPass *VulkanQueueRunner::Perfor
+ 	if (!step.render.framebuffer) {
+ 		// Rendering to backbuffer, must rotate, just like scissors.
+ 		DisplayRect<int> rotated_rc{ rc.offset.x, rc.offset.y, (int)rc.extent.width, (int)rc.extent.height };
+-		RotateRectToDisplay(rotated_rc, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
++		RotateRectToDisplay(rotated_rc, vulkan_->GetSwapchainImageWidth(), vulkan_->GetSwapchainImageHeight());
+ 
+ 		rc.offset.x = rotated_rc.x;
+ 		rc.offset.y = rotated_rc.y;
+diff -urpN a/Common/GPU/Vulkan/VulkanRenderManager.cpp b/Common/GPU/Vulkan/VulkanRenderManager.cpp
+--- a/Common/GPU/Vulkan/VulkanRenderManager.cpp	2026-05-09 23:37:35.590166389 +0000
++++ b/Common/GPU/Vulkan/VulkanRenderManager.cpp	2026-05-10 00:05:41.075266925 +0000
+@@ -410,7 +410,7 @@ bool VulkanRenderManager::CreateSwapchai
+ 
+ 	// Must be before InitBackbufferRenderPass.
+ 	if (queueRunner_.InitDepthStencilBuffer(cmdInit, barriers)) {
+-		queueRunner_.InitBackbufferFramebuffers(vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight(), frameDataShared);
++		queueRunner_.InitBackbufferFramebuffers(vulkan_->GetSwapchainImageWidth(), vulkan_->GetSwapchainImageHeight(), frameDataShared);
+ 	}
+ 	return true;
+ }
+@@ -1130,8 +1130,22 @@ void VulkanRenderManager::BindFramebuffe
+ 	} else {
+ 		curWidthRaw_ = vulkan_->GetBackbufferWidth();
+ 		curHeightRaw_ = vulkan_->GetBackbufferHeight();
+-		if (g_display.rotation == DisplayRotation::ROTATE_90 ||
+-			g_display.rotation == DisplayRotation::ROTATE_270) {
++		// curWidth_/curHeight_ feed renderArea, which is then transformed by
++		// RotateRectToDisplay (in VulkanQueueRunner) into the actual VkRect2D
++		// for the renderpass.  RotateRectToDisplay expects the *input* rect's
++		// dims to be the swapped form of the destination (swapchain image)
++		// dims.  When driver-side rotation is in effect, swapchain images are
++		// at swapped/logical dims, so we swap curWidthRaw_/curHeightRaw_.
++		// When application-side rotation is in effect (PPSSPP_DISPLAY_ROTATION
++		// on Mali rk3576 etc.), swapchain images stay at physical dims while
++		// GetBackbufferWidth/Height already report logical dims; in that case
++		// we must NOT swap, because GetBackbufferWidth/Height are already the
++		// "swapped" form of the destination dims.
++		const bool appSideRotation =
++			vulkan_->GetBackbufferWidth() != vulkan_->GetSwapchainImageWidth() ||
++			vulkan_->GetBackbufferHeight() != vulkan_->GetSwapchainImageHeight();
++		if (!appSideRotation && (g_display.rotation == DisplayRotation::ROTATE_90 ||
++			g_display.rotation == DisplayRotation::ROTATE_270)) {
+ 			curWidth_ = curHeightRaw_;
+ 			curHeight_ = curWidthRaw_;
+ 		} else {

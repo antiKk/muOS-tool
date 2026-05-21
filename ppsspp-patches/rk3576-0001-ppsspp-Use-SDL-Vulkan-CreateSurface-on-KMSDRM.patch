@@ -1,0 +1,86 @@
+From: muOS Developer
+Date: Thu, 8 May 2026 00:00:00 +0000
+Subject: [PATCH] Use SDL_Vulkan_CreateSurface on KMSDRM
+
+On KMSDRM, SDL opens the DRM device and holds DRM master before PPSSPP
+gets control, so the existing WINDOWSYSTEM_DISPLAY path -- which calls
+vkGetPhysicalDeviceDisplayPropertiesKHR / vkCreateDisplayPlaneSurfaceKHR
+itself -- cannot enumerate displays correctly.  It also matches modes
+against g_display.pixel_xres / pixel_yres, which on rotated panels are
+swapped relative to the physical display modes, so even when display
+enumeration works, no mode is found.
+
+This patch:
+
+1. Adds a new generic WINDOWSYSTEM_SURFACE_CREATED window-system type to
+   VulkanContext.  When InitSurface() is called with this type, it simply
+   adopts a VkSurfaceKHR that the caller has already created.  This keeps
+   VulkanContext platform-agnostic -- it doesn't need to know about SDL
+   or about display rotation.
+
+2. Changes the KMSDRM case in SDLVulkanGraphicsContext to call
+   SDL_Vulkan_CreateSurface() and pass the resulting surface in via
+   WINDOWSYSTEM_SURFACE_CREATED.  SDL2's KMSDRM backend (with the
+   accompanying SDL2 rotation patch) sets the appropriate
+   VkSurfaceTransformFlagBitsKHR for the panel orientation, so rotated
+   panels render correctly.
+---
+--- a/Common/GPU/Vulkan/VulkanContext.h	2026-05-08 13:16:56.484942852 +0000
++++ b/Common/GPU/Vulkan/VulkanContext.h	2026-05-08 13:17:12.672598956 +0000
+@@ -74,6 +74,9 @@ enum WindowSystem {
+ #ifdef VK_USE_PLATFORM_DISPLAY_KHR
+ 	WINDOWSYSTEM_DISPLAY,
+ #endif
++	// Surface has already been created externally (e.g., by SDL_Vulkan_CreateSurface).
++	// data1 is the VkSurfaceKHR to adopt; data2 is unused.
++	WINDOWSYSTEM_SURFACE_CREATED,
+ };
+ 
+ struct VulkanPhysicalDeviceInfo {
+--- a/Common/GPU/Vulkan/VulkanContext.cpp	2026-05-08 13:16:57.016942834 +0000
++++ b/Common/GPU/Vulkan/VulkanContext.cpp	2026-05-08 13:17:28.201369776 +0000
+@@ -1041,6 +1041,14 @@ VkResult VulkanContext::ReinitSurface()
+ 		break;
+ 	}
+ #endif
++	case WINDOWSYSTEM_SURFACE_CREATED:
++	{
++		// The surface was already created externally (e.g. by SDL_Vulkan_CreateSurface).
++		// Just adopt it; ownership stays with us until DestroySurface().
++		surface_ = (VkSurfaceKHR)(uintptr_t)winsysData1_;
++		retval = (surface_ != VK_NULL_HANDLE) ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
++		break;
++	}
+ #if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+ 	case WINDOWSYSTEM_DISPLAY:
+ 	{
+--- a/SDL/SDLVulkanGraphicsContext.cpp	2026-05-08 13:16:58.504942785 +0000
++++ b/SDL/SDLVulkanGraphicsContext.cpp	2026-05-08 13:17:40.400483305 +0000
+@@ -114,13 +114,21 @@ bool SDLVulkanGraphicsContext::Init(SDL_
+ #endif
+ #endif
+ #if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+-	case SDL_SYSWM_KMSDRM:
+-		/*
+-		There is no problem passing null for the next two arguments, and reinit will be called later
+-		huangzihan china
+-		*/
+-		vulkan_->InitSurface(WINDOWSYSTEM_DISPLAY, nullptr, nullptr);
++	case SDL_SYSWM_KMSDRM: {
++		// On KMSDRM, SDL has already opened the DRM device and holds DRM master,
++		// so we can't enumerate VK_KHR_display ourselves.  Let SDL create the
++		// VkSurfaceKHR (it uses its patched KMSDRM_Vulkan_CreateSurface, which
++		// handles panel rotation natively via VkDisplaySurfaceCreateInfoKHR.transform),
++		// then hand the surface to VulkanContext.
++		VkSurfaceKHR sdl_surface = VK_NULL_HANDLE;
++		if (!SDL_Vulkan_CreateSurface(window, vulkan_->GetInstance(), &sdl_surface)) {
++			fprintf(stderr, "SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
++			exit(1);
++		}
++		vulkan_->InitSurface(WINDOWSYSTEM_SURFACE_CREATED,
++		                     (void *)(uintptr_t)sdl_surface, nullptr);
+ 		break;
++	}
+ #endif
+ 	default:
+ 		fprintf(stderr, "Vulkan subsystem %d not supported\n", sys_info.subsystem);
